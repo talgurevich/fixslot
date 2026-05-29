@@ -1,0 +1,65 @@
+// Prisma schema for the fixslot MVP.
+// See spec.md §4 for the data model and rationale.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Recurring weekly availability window, e.g. "Mondays 09:00–12:00".
+model AvailabilityRule {
+  id        Int    @id @default(autoincrement())
+  weekday   Int // 0 = Sunday .. 6 = Saturday (JS getDay convention)
+  startTime String // "09:00"
+  endTime   String // "12:00"
+}
+
+// A day (or part of a day) the trainer is unavailable. Subtracted from availability.
+// If startTime/endTime are null the whole day is blocked; otherwise only that window.
+model Blackout {
+  id        Int     @id @default(autoincrement())
+  date      String // "YYYY-MM-DD" interpreted in Config.timezone
+  startTime String? // optional "HH:MM"
+  endTime   String? // optional "HH:MM"
+}
+
+// A confirmed booking. The unique constraint on startTime is the final
+// double-booking backstop (spec §5).
+model Booking {
+  id          Int      @id @default(autoincrement())
+  clientPhone String
+  clientName  String
+  startTime   DateTime @unique
+  status      String   @default("confirmed")
+  createdAt   DateTime @default(now())
+}
+
+// Per-client conversation state for the booking flow (spec §6). One row per client.
+model Conversation {
+  id           Int       @id @default(autoincrement())
+  clientPhone  String    @unique
+  state        String    @default("IDLE") // IDLE | AWAITING_SELECTION
+  offeredSlots String    @default("{}") // JSON: { "1": "<ISO datetime>", ... }
+  offeredAt    DateTime?
+  updatedAt    DateTime  @updatedAt
+}
+
+// Single-row global configuration (spec §4). Seeded with one row.
+model Config {
+  id                  Int    @id @default(autoincrement())
+  slotDurationMinutes Int    @default(60)
+  bookingHorizonDays  Int    @default(14)
+  maxSlotsOffered     Int    @default(5)
+  trainerPhone        String @default("")
+  timezone            String @default("Asia/Jerusalem")
+
+  // Editable message templates. {slot} and {max} are substituted at send time.
+  greetingTemplate     String @default("Hi! Here are the next open slots:")
+  confirmationTemplate String @default("Booked! {slot}. See you then ✅")
+  noSlotsTemplate      String @default("Sorry, there are no open times right now — please check back later.")
+  repromptTemplate     String @default("Please reply with one of the numbers above, e.g. 1–{max}.")
+}
