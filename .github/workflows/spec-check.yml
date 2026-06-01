@@ -1,0 +1,112 @@
+name: Spec Check
+
+# Runs on every PR open and every push to an open PR.
+# Reads spec.md from the repo root, plus the PR title/body/diff, and asks Claude
+# to judge whether the PR delivers what the spec describes. Posts (or edits) a
+# single comment on the PR with the verdict.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  spec-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Gather everything the model needs to see
+      - name: Gather PR context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # PR diff — capped at 100KB so token cost stays sane on huge PRs
+          gh pr diff "$PR_NUMBER" | head -c 100000 > /tmp/pr.diff
+
+          # Spec — fall back gracefully if missing
+          if [ -f spec.md ]; then
+            cp spec.md /tmp/spec.md
+          else
+            echo "(no spec.md found at repo root)" > /tmp/spec.md
+          fi
+
+          # PR title + body
+          jq -r '.pull_request.title'      "$GITHUB_EVENT_PATH" > /tmp/pr.title
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > /tmp/pr.body
+
+      # 2. Ask Claude. Output goes to /tmp/review.md
+      - name: Ask Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          PROMPT=$(jq -n \
+            --rawfile spec  /tmp/spec.md \
+            --rawfile title /tmp/pr.title \
+            --rawfile body  /tmp/pr.body \
+            --rawfile diff  /tmp/pr.diff '
+            "You are a strict, friendly code reviewer for a small team.\n" +
+            "Check whether this PR delivers what the SPEC and PR description ask for.\n\n" +
+            "## SPEC\n" + $spec + "\n\n" +
+            "## PR TITLE\n" + $title + "\n" +
+            "## PR DESCRIPTION\n" + $body + "\n\n" +
+            "## DIFF\n```diff\n" + $diff + "\n```\n\n" +
+            "## YOUR REVIEW — return exactly this Markdown:\n\n" +
+            "**Verdict:** ✅ matches / ⚠️ partial / ❌ off-spec\n\n" +
+            "**What matches the spec**\n- bullets, file paths where useful\n\n" +
+            "**Gaps or mismatches**\n- bullets; be specific\n\n" +
+            "**Risks / things to double-check**\n- short bullets; \"none\" if clean\n\n" +
+            "Be terse. No filler. Quote tiny code snippets only if essential."
+          ')
+
+          RESPONSE=$(curl -sS https://api.anthropic.com/v1/messages \
+            --max-time 120 \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n --arg p "$PROMPT" '{
+              model: "claude-sonnet-4-6",
+              max_tokens: 1500,
+              messages: [{role: "user", content: $p}]
+            }')")
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // .error.message // "(Claude returned no text)"')
+          printf '%s\n' "$REVIEW" > /tmp/review.md
+
+      # 3. Post the comment — edit existing bot comment if found, else create
+      - name: Post / update PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          MARKER="<!-- spec-check-bot -->"
+
+          {
+            echo "$MARKER"
+            echo "## 🤖 Spec check"
+            echo
+            cat /tmp/review.md
+            echo
+            echo "---"
+            echo "_Posted automatically. Re-runs on every push._"
+          } > /tmp/comment.md
+
+          EXISTING_ID=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
+
+          if [ -n "$EXISTING_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_ID" \
+              -X PATCH -F body=@/tmp/comment.md
+          else
+            gh pr comment "$PR_NUMBER" --body-file /tmp/comment.md
+          fi
