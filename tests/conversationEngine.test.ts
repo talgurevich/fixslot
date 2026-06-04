@@ -104,6 +104,72 @@ describe("conversationEngine", () => {
     expect(convo?.state).toBe("IDLE");
   });
 
+  it("cancels an upcoming booking via the 'cancel' keyword, notifies trainer, and frees the slot", async () => {
+    const fake = new FakeProvider();
+
+    // Book a slot first.
+    await handleInbound(fake, CLIENT, "hi", { now: NOW });
+    await handleInbound(fake, CLIENT, "1", { now: NOW, clientName: "Test Client" });
+    expect(await prisma.booking.count()).toBe(1);
+    fake.clear();
+
+    // Client asks to cancel — gets a numbered list of their upcoming bookings.
+    await handleInbound(fake, CLIENT, "cancel", { now: NOW });
+    let convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+    expect(convo?.state).toBe("AWAITING_CANCEL_SELECTION");
+    expect(fake.last()!.text).toContain("Your upcoming bookings");
+    expect(fake.last()!.text).toContain("1.");
+    fake.clear();
+
+    // Client picks 1 to cancel.
+    await handleInbound(fake, CLIENT, "1", { now: NOW });
+    expect(await prisma.booking.count()).toBe(0);
+
+    const confirm = fake.sent.find((m) => m.toPhone === CLIENT && m.text.startsWith("Cancelled:"));
+    const trainerNote = fake.sent.find((m) => m.toPhone === "972540000000");
+    expect(confirm).toBeTruthy();
+    expect(trainerNote).toBeTruthy();
+    expect(trainerNote!.text).toContain("Cancelled");
+    expect(trainerNote!.text).toContain("Test Client");
+
+    convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+    expect(convo?.state).toBe("IDLE");
+
+    // The freed slot is now offered again to the next client (spec issue: "a
+    // cancelled slot becomes bookable again — must reappear in generateSlots").
+    const next = new FakeProvider();
+    await handleInbound(next, "972509999999", "hi", { now: NOW });
+    const offered = JSON.parse(
+      (await prisma.conversation.findUnique({ where: { clientPhone: "972509999999" } }))!.offeredSlots,
+    ) as Record<string, string>;
+    expect(Object.values(offered)).toContain(at(`${MONDAY}T09:00`).toISOString());
+  });
+
+  it("replies 'nothing to cancel' when the client has no upcoming bookings", async () => {
+    const fake = new FakeProvider();
+    await handleInbound(fake, CLIENT, "cancel", { now: NOW });
+
+    expect(fake.last()!.text).toContain("no upcoming bookings");
+    expect(await prisma.booking.count()).toBe(0);
+    const convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+    expect(convo?.state).toBe("IDLE");
+  });
+
+  it("reprompts on invalid input while awaiting cancel selection, keeping state", async () => {
+    const fake = new FakeProvider();
+    await handleInbound(fake, CLIENT, "hi", { now: NOW });
+    await handleInbound(fake, CLIENT, "1", { now: NOW, clientName: "Test Client" });
+    await handleInbound(fake, CLIENT, "cancel", { now: NOW });
+    fake.clear();
+
+    await handleInbound(fake, CLIENT, "not a number", { now: NOW });
+
+    expect(fake.last()!.text).toContain("number");
+    expect(await prisma.booking.count()).toBe(1); // booking unchanged
+    const convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+    expect(convo?.state).toBe("AWAITING_CANCEL_SELECTION");
+  });
+
   it("re-offers fresh slots when the picked slot was taken in the meantime (stale pick)", async () => {
     const fake = new FakeProvider();
     await handleInbound(fake, CLIENT, "hi", { now: NOW });

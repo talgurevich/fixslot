@@ -40,3 +40,17 @@ export async function notifyTrainerOfReschedule(
   const text = `Rescheduled: ${n.clientName} (${n.clientPhone}) moved from ${oldSlot} → ${newSlot}`;
   await provider.sendMessage(n.trainerPhone, text);
 }
+
+// Notify the trainer when a booking is cancelled — whether the client cancelled
+// via WhatsApp or the trainer cancelled it from the dashboard. Symmetric with
+// the booking notification so the trainer's WhatsApp is the single source of
+// truth for booking activity.
+export async function notifyTrainerOfCancellation(
+  provider: MessagingProvider,
+  n: BookingNotification,
+): Promise<void> {
+  if (!n.trainerPhone) return;
+  const slot = formatSlot(n.startTime, n.timezone);
+  const text = `Cancelled: ${n.clientName} (${n.clientPhone}) — ${slot}`;
+  await provider.sendMessage(n.trainerPhone, text);
+}

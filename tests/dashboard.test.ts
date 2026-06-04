@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import request from "supertest";
 import { createApp } from "../src/index";
+import { prisma } from "../src/db";
+import { FakeProvider, getProvider } from "../src/messaging";
 
 const app = createApp();
 const PASSWORD = "test-password";
@@ -73,11 +75,53 @@ describe("dashboard API", () => {
     expect(res.body.maxSlotsOffered).toBe(7);
   });
 
-  it("lists bookings (read-only) and exposes no cancel endpoint", async () => {
+  it("lists bookings", async () => {
     const agent = await loginAgent();
     const res = await agent.get("/api/bookings");
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
+  });
+
+  it("cancels a booking, notifies the client, and frees the slot", async () => {
+    const agent = await loginAgent();
+
+    // Seed a config with a trainer phone so the cancellation notification fires.
+    await prisma.config.deleteMany();
+    await prisma.config.create({
+      data: { trainerPhone: "972540000000", timezone: "Asia/Jerusalem" },
+    });
+    const booking = await prisma.booking.create({
+      data: {
+        clientPhone: "972500000001",
+        clientName: "Cancel Me",
+        startTime: new Date("2099-01-01T09:00:00.000Z"),
+      },
+    });
+
+    const fake = getProvider() as FakeProvider;
+    fake.clear();
+
+    const del = await agent.delete(`/api/bookings/${booking.id}`);
+    expect(del.status).toBe(204);
+    expect(await prisma.booking.findUnique({ where: { id: booking.id } })).toBeNull();
+
+    const clientMsg = fake.sent.find((m) => m.toPhone === "972500000001");
+    const trainerMsg = fake.sent.find((m) => m.toPhone === "972540000000");
+    expect(clientMsg).toBeTruthy();
+    expect(clientMsg!.text.toLowerCase()).toContain("cancelled");
+    expect(trainerMsg).toBeTruthy();
+    expect(trainerMsg!.text).toContain("Cancel Me");
+  });
+
+  it("returns 404 when cancelling a booking that does not exist", async () => {
+    const agent = await loginAgent();
+    const res = await agent.delete("/api/bookings/9999999");
+    expect(res.status).toBe(404);
+  });
+
+  it("requires auth to cancel a booking", async () => {
+    const res = await request(app).delete("/api/bookings/1");
+    expect(res.status).toBe(401);
   });
 
   it("runs the dev simulator end to end", async () => {
