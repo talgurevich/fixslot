@@ -18,13 +18,12 @@ async function seedConfig(leadMinutes = 60) {
   });
 }
 
-function bookingAt(startTime: Date, overrides: Partial<{ status: string; clientPhone: string }> = {}) {
+function bookingAt(startTime: Date, overrides: Partial<{ clientPhone: string }> = {}) {
   return prisma.booking.create({
     data: {
       clientPhone: overrides.clientPhone ?? CLIENT,
       clientName: "Test Client",
       startTime,
-      status: overrides.status ?? "confirmed",
     },
   });
 }
@@ -58,11 +57,14 @@ describe("findDueReminders (pure)", () => {
   });
 
   it("skips past bookings, already-reminded bookings, and non-confirmed bookings", () => {
+    // "non-confirmed" is anything other than the only status the schema
+    // currently defines ("confirmed", spec §4). The filter is forward-
+    // compatible with whatever the cancellation lane lands as.
     const due = findDueReminders(
       [
         { ...base, id: 1, startTime: new Date(NOW.getTime() - 10 * 60_000) }, // past
         { ...base, id: 2, startTime: new Date(NOW.getTime() + 10 * 60_000), reminderSentAt: NOW }, // already reminded
-        { ...base, id: 3, startTime: new Date(NOW.getTime() + 10 * 60_000), status: "cancelled" },
+        { ...base, id: 3, startTime: new Date(NOW.getTime() + 10 * 60_000), status: "any-non-confirmed-status" },
       ],
       60,
       NOW,
@@ -78,7 +80,7 @@ describe("runRemindersOnce (DB + provider)", () => {
     const booking = await bookingAt(new Date(NOW.getTime() + 30 * 60_000));
     const fake = new FakeProvider();
 
-    const sent = await runRemindersOnce(fake, NOW);
+    const sent = await runRemindersOnce(fake, { now: NOW });
 
     expect(sent).toBe(1);
     expect(fake.sent).toHaveLength(1);
@@ -93,7 +95,7 @@ describe("runRemindersOnce (DB + provider)", () => {
     await bookingAt(new Date(NOW.getTime() + 3 * 60 * 60_000)); // 3h out, lead is 60min
     const fake = new FakeProvider();
 
-    const sent = await runRemindersOnce(fake, NOW);
+    const sent = await runRemindersOnce(fake, { now: NOW });
 
     expect(sent).toBe(0);
     expect(fake.sent).toHaveLength(0);
@@ -103,9 +105,9 @@ describe("runRemindersOnce (DB + provider)", () => {
     await bookingAt(new Date(NOW.getTime() + 30 * 60_000));
     const fake = new FakeProvider();
 
-    await runRemindersOnce(fake, NOW);
-    await runRemindersOnce(fake, NOW);
-    await runRemindersOnce(fake, NOW);
+    await runRemindersOnce(fake, { now: NOW });
+    await runRemindersOnce(fake, { now: NOW });
+    await runRemindersOnce(fake, { now: NOW });
 
     expect(fake.sent).toHaveLength(1);
   });
@@ -114,19 +116,28 @@ describe("runRemindersOnce (DB + provider)", () => {
     await bookingAt(new Date(NOW.getTime() - 60 * 60_000));
     const fake = new FakeProvider();
 
-    const sent = await runRemindersOnce(fake, NOW);
+    const sent = await runRemindersOnce(fake, { now: NOW });
 
     expect(sent).toBe(0);
     expect(fake.sent).toHaveLength(0);
   });
 
-  it("does not remind cancelled bookings", async () => {
-    await bookingAt(new Date(NOW.getTime() + 30 * 60_000), { status: "cancelled" });
-    const fake = new FakeProvider();
+  it("retries once on send failure and recovers", async () => {
+    await bookingAt(new Date(NOW.getTime() + 30 * 60_000));
+    let calls = 0;
+    const flaky = {
+      sent: [] as { toPhone: string; text: string }[],
+      sendMessage: async (toPhone: string, text: string) => {
+        calls++;
+        if (calls === 1) throw new Error("transient");
+        flaky.sent.push({ toPhone, text });
+      },
+    };
 
-    const sent = await runRemindersOnce(fake, NOW);
+    const sent = await runRemindersOnce(flaky as never, { now: NOW });
 
-    expect(sent).toBe(0);
-    expect(fake.sent).toHaveLength(0);
+    expect(calls).toBe(2);
+    expect(sent).toBe(1);
+    expect(flaky.sent).toHaveLength(1);
   });
 });

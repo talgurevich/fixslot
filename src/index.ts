@@ -42,7 +42,7 @@ if (require.main === module) {
 
     const provider = getProvider();
     const tick = () =>
-      runRemindersOnce(provider).catch((err) =>
+      runRemindersOnce(provider, {}).catch((err) =>
         console.error("[reminders] tick failed:", err),
       );
     void tick(); // catch any bookings already inside the lead window at boot

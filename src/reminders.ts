@@ -29,16 +29,24 @@ function reminderText(config: Config, startTime: Date): string {
   );
 }
 
+export interface RunRemindersOptions {
+  now?: Date;
+  config?: Config;
+  prisma?: PrismaClient;
+}
+
 // Find every due reminder and send it through the messaging adapter.
 // At-most-once is enforced by a conditional update: we set `reminderSentAt`
 // only if it is still NULL, so even if two ticks race or the process restarts
 // mid-loop, a given booking can only be claimed (and sent) once.
 export async function runRemindersOnce(
   provider: MessagingProvider,
-  now: Date = new Date(),
-  prisma: PrismaClient = defaultPrisma,
+  opts: RunRemindersOptions = {},
 ): Promise<number> {
-  const config = await getConfig();
+  const now = opts.now ?? new Date();
+  const prisma = opts.prisma ?? defaultPrisma;
+  const config = opts.config ?? (await getConfig());
+
   const candidates = await prisma.booking.findMany({
     where: {
       status: "confirmed",
@@ -57,8 +65,31 @@ export async function runRemindersOnce(
       data: { reminderSentAt: now },
     });
     if (claim.count === 0) continue; // someone else already claimed it
-    await provider.sendMessage(booking.clientPhone, reminderText(config, booking.startTime));
-    sent++;
+    if (await sendWithRetry(provider, booking.clientPhone, reminderText(config, booking.startTime))) {
+      sent++;
+    }
   }
   return sent;
+}
+
+// Per spec §8 ("log and retry once") — try once, retry once on failure, then
+// give up and log. The booking stays claimed either way so we never spam the
+// client on subsequent ticks; in the worst case a single reminder is lost.
+async function sendWithRetry(
+  provider: MessagingProvider,
+  to: string,
+  text: string,
+): Promise<boolean> {
+  try {
+    await provider.sendMessage(to, text);
+    return true;
+  } catch (err) {
+    try {
+      await provider.sendMessage(to, text);
+      return true;
+    } catch (err2) {
+      console.error(`[reminders] send failed (after retry) for ${to}:`, err2);
+      return false;
+    }
+  }
 }
