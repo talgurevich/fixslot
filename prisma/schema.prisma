@@ -30,12 +30,15 @@ model Blackout {
 // A confirmed booking. The unique constraint on startTime is the final
 // double-booking backstop (spec §5).
 model Booking {
-  id          Int      @id @default(autoincrement())
+  id          Int       @id @default(autoincrement())
   clientPhone String
   clientName  String
-  startTime   DateTime @unique
-  status      String   @default("confirmed")
-  createdAt   DateTime @default(now())
+  startTime   DateTime  @unique
+  status      String    @default("confirmed")
+  createdAt   DateTime  @default(now())
+  // Set when the pre-session reminder has been sent. Null = not yet reminded.
+  // Used by the reminders job to guarantee at-most-once delivery across runs.
+  reminderSentAt DateTime?
 }
 
 // Per-client conversation state for the booking flow (spec §6). One row per client.
@@ -62,4 +65,9 @@ model Config {
   confirmationTemplate String @default("Booked! {slot}. See you then ✅")
   noSlotsTemplate      String @default("Sorry, there are no open times right now — please check back later.")
   repromptTemplate     String @default("Please reply with one of the numbers above, e.g. 1–{max}.")
+
+  // How long before a session the reminder is sent (default 24h), and the
+  // template used. {slot} is substituted with the formatted start time.
+  reminderLeadMinutes Int    @default(1440)
+  reminderTemplate    String @default("Reminder: you have a session {slot}. See you then!")
 }
