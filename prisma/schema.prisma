@@ -40,12 +40,13 @@ model Booking {
 
 // Per-client conversation state for the booking flow (spec §6). One row per client.
 model Conversation {
-  id           Int       @id @default(autoincrement())
-  clientPhone  String    @unique
-  state        String    @default("IDLE") // IDLE | AWAITING_SELECTION
-  offeredSlots String    @default("{}") // JSON: { "1": "<ISO datetime>", ... }
-  offeredAt    DateTime?
-  updatedAt    DateTime  @updatedAt
+  id                    Int       @id @default(autoincrement())
+  clientPhone           String    @unique
+  state                 String    @default("IDLE") // IDLE | AWAITING_SELECTION | AWAITING_RESCHEDULE
+  offeredSlots          String    @default("{}") // JSON: { "1": "<ISO datetime>", ... }
+  offeredAt             DateTime?
+  reschedulingBookingId Int? // set during AWAITING_RESCHEDULE: the booking being moved
+  updatedAt             DateTime  @updatedAt
 }
 
 // Single-row global configuration (spec §4). Seeded with one row.

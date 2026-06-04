@@ -125,4 +125,107 @@ describe("conversationEngine", () => {
     const offered = JSON.parse(convo!.offeredSlots) as Record<string, string>;
     expect(Object.values(offered)).not.toContain(at(`${MONDAY}T09:00`).toISOString());
   });
+
+  describe("reschedule flow", () => {
+    async function bookClientSlot(startTime: Date) {
+      return prisma.booking.create({
+        data: { clientPhone: CLIENT, clientName: "Test Client", startTime },
+      });
+    }
+
+    it("offers reschedule slots when client has an upcoming booking", async () => {
+      const existingSlot = at(`${MONDAY}T09:00`);
+      await bookClientSlot(existingSlot);
+
+      const fake = new FakeProvider();
+      await handleInbound(fake, CLIENT, "hi", { now: NOW });
+
+      const text = fake.last()!.text;
+      expect(text).toContain("You have a booking for");
+      expect(text).toContain("reschedule");
+      expect(text).toContain("Reply with a number to book.");
+
+      const convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+      expect(convo?.state).toBe("AWAITING_RESCHEDULE");
+      expect(convo?.reschedulingBookingId).not.toBeNull();
+    });
+
+    it("moves the booking to the new slot and confirms (happy path)", async () => {
+      const existingSlot = at(`${MONDAY}T09:00`);
+      const booking = await bookClientSlot(existingSlot);
+
+      const fake = new FakeProvider();
+      await handleInbound(fake, CLIENT, "hi", { now: NOW });
+      fake.clear();
+
+      // Pick the second offered slot (10:00) since 09:00 is already the booking.
+      await handleInbound(fake, CLIENT, "1", { now: NOW, clientName: "Test Client" });
+
+      // Only one booking should exist (updated, not a second row).
+      expect(await prisma.booking.count()).toBe(1);
+      const updated = await prisma.booking.findUnique({ where: { id: booking.id } });
+      expect(updated!.startTime.toISOString()).not.toBe(existingSlot.toISOString());
+
+      const confirmation = fake.sent.find((m) => m.toPhone === CLIENT);
+      expect(confirmation!.text).toContain("Rescheduled!");
+
+      const trainerMsg = fake.sent.find((m) => m.toPhone === "972540000000");
+      expect(trainerMsg!.text).toContain("Rescheduled:");
+      expect(trainerMsg!.text).toContain("Test Client");
+
+      const convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+      expect(convo?.state).toBe("IDLE");
+      expect(convo?.reschedulingBookingId).toBeNull();
+    });
+
+    it("reprompts on invalid input during reschedule without changing state", async () => {
+      await bookClientSlot(at(`${MONDAY}T09:00`));
+
+      const fake = new FakeProvider();
+      await handleInbound(fake, CLIENT, "hi", { now: NOW });
+      fake.clear();
+
+      await handleInbound(fake, CLIENT, "not a number", { now: NOW });
+
+      expect(fake.last()!.text).toContain("number");
+      const convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+      expect(convo?.state).toBe("AWAITING_RESCHEDULE");
+    });
+
+    it("re-offers fresh slots when the target slot is taken during reschedule (stale pick)", async () => {
+      await bookClientSlot(at(`${MONDAY}T09:00`));
+
+      const fake = new FakeProvider();
+      await handleInbound(fake, CLIENT, "hi", { now: NOW });
+
+      // Someone books slot #1 of the offered list before the client replies.
+      const offered = JSON.parse(
+        (await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } }))!.offeredSlots,
+      ) as Record<string, string>;
+      const slot1Time = new Date(offered["1"]);
+      await prisma.booking.create({
+        data: { clientPhone: "972509999999", clientName: "Other", startTime: slot1Time },
+      });
+      fake.clear();
+
+      await handleInbound(fake, CLIENT, "1", { now: NOW });
+
+      expect(fake.last()!.text).toContain("just taken");
+      const convo = await prisma.conversation.findUnique({ where: { clientPhone: CLIENT } });
+      expect(convo?.state).toBe("AWAITING_RESCHEDULE");
+    });
+
+    it("original slot becomes bookable by others after reschedule", async () => {
+      const existingSlot = at(`${MONDAY}T09:00`);
+      await bookClientSlot(existingSlot);
+
+      const fake = new FakeProvider();
+      await handleInbound(fake, CLIENT, "hi", { now: NOW });
+      await handleInbound(fake, CLIENT, "1", { now: NOW, clientName: "Test Client" });
+
+      // The old slot should no longer be in Booking as the startTime of this booking.
+      const stillAtOld = await prisma.booking.findUnique({ where: { startTime: existingSlot } });
+      expect(stillAtOld).toBeNull();
+    });
+  });
 });

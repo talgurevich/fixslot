@@ -3,7 +3,7 @@ import { prisma, getConfig } from "./db";
 import { MessagingProvider } from "./messaging";
 import { generateSlots } from "./slotGenerator";
 import { formatSlot } from "./format";
-import { notifyTrainerOfBooking } from "./notifier";
+import { notifyTrainerOfBooking, notifyTrainerOfReschedule } from "./notifier";
 
 export interface InboundOptions {
   now?: Date;
@@ -35,7 +35,23 @@ export async function handleInbound(
     return;
   }
 
-  // IDLE or brand-new conversation: offer the next open slots.
+  if (convo.state === "AWAITING_RESCHEDULE") {
+    await handleReschedule(provider, phone, text, convo, config, now, clientName);
+    return;
+  }
+
+  // IDLE: if the client has an upcoming booking, enter the reschedule flow.
+  const existingBooking = await prisma.booking.findFirst({
+    where: { clientPhone: phone, startTime: { gt: now } },
+    orderBy: { startTime: "asc" },
+  });
+
+  if (existingBooking) {
+    await offerRescheduleSlots(provider, phone, config, now, existingBooking, false);
+    return;
+  }
+
+  // No upcoming booking — offer slots for a new booking.
   await offerSlots(provider, phone, config, now, false);
 }
 
@@ -93,6 +109,127 @@ async function handleSelection(
     startTime,
     timezone: config.timezone,
   });
+}
+
+async function handleReschedule(
+  provider: MessagingProvider,
+  phone: string,
+  text: string,
+  convo: Conversation,
+  config: Config,
+  now: Date,
+  clientName: string,
+): Promise<void> {
+  const offered = JSON.parse(convo.offeredSlots) as Record<string, string>;
+  const offeredCount = Object.keys(offered).length;
+
+  const match = text.match(/^(\d+)$/);
+  const iso = match ? offered[match[1]] : undefined;
+  if (!iso) {
+    await provider.sendMessage(phone, reprompt(config, offeredCount));
+    return;
+  }
+
+  const newStartTime = new Date(iso);
+
+  const bookingId = convo.reschedulingBookingId;
+  if (!bookingId) {
+    await offerSlots(provider, phone, config, now, false);
+    return;
+  }
+
+  const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+  if (!booking) {
+    // Booking disappeared — fall back to new booking flow.
+    await offerSlots(provider, phone, config, now, false);
+    return;
+  }
+
+  if (!(await isSlotStillOpen(newStartTime, now))) {
+    await offerRescheduleSlots(provider, phone, config, now, booking, true);
+    return;
+  }
+
+  const oldStartTime = booking.startTime;
+
+  try {
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { startTime: newStartTime },
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      await offerRescheduleSlots(provider, phone, config, now, booking, true);
+      return;
+    }
+    throw err;
+  }
+
+  await prisma.conversation.update({
+    where: { clientPhone: phone },
+    data: { state: "IDLE", offeredSlots: "{}", offeredAt: null, reschedulingBookingId: null },
+  });
+
+  await provider.sendMessage(phone, rescheduleConfirmation(config, newStartTime));
+  await notifyTrainerOfReschedule(provider, {
+    trainerPhone: config.trainerPhone,
+    clientName,
+    clientPhone: phone,
+    oldStartTime,
+    newStartTime,
+    timezone: config.timezone,
+  });
+}
+
+async function offerRescheduleSlots(
+  provider: MessagingProvider,
+  phone: string,
+  config: Config,
+  now: Date,
+  existingBooking: { id: number; startTime: Date },
+  stale: boolean,
+): Promise<void> {
+  const [rules, blackouts, bookings] = await Promise.all([
+    prisma.availabilityRule.findMany(),
+    prisma.blackout.findMany(),
+    prisma.booking.findMany(),
+  ]);
+
+  const slots = generateSlots(rules, blackouts, bookings, config, now);
+
+  if (slots.length === 0) {
+    await prisma.conversation.update({
+      where: { clientPhone: phone },
+      data: { state: "IDLE", offeredSlots: "{}", offeredAt: null, reschedulingBookingId: null },
+    });
+    await provider.sendMessage(phone, config.noSlotsTemplate);
+    return;
+  }
+
+  const offered: Record<string, string> = {};
+  const lines: string[] = [];
+  slots.forEach((slot, idx) => {
+    const n = idx + 1;
+    offered[String(n)] = slot.start.toISOString();
+    lines.push(`${n}. ${formatSlot(slot.start, config.timezone)}`);
+  });
+
+  await prisma.conversation.update({
+    where: { clientPhone: phone },
+    data: {
+      state: "AWAITING_RESCHEDULE",
+      offeredSlots: JSON.stringify(offered),
+      offeredAt: now,
+      reschedulingBookingId: existingBooking.id,
+    },
+  });
+
+  const currentSlotLabel = formatSlot(existingBooking.startTime, config.timezone);
+  const header = stale
+    ? "Sorry, that slot was just taken. Here are other open slots:"
+    : `You have a booking for ${currentSlotLabel}. To reschedule, pick a new slot:`;
+  const body = `${header}\n${lines.join("\n")}\nReply with a number to book.`;
+  await provider.sendMessage(phone, body);
 }
 
 async function offerSlots(
@@ -159,6 +296,10 @@ function confirmation(config: Config, startTime: Date): string {
     "{slot}",
     formatSlot(startTime, config.timezone),
   );
+}
+
+function rescheduleConfirmation(config: Config, newStartTime: Date): string {
+  return `Rescheduled! ${formatSlot(newStartTime, config.timezone)}. See you then ✅`;
 }
 
 function isUniqueViolation(err: unknown): boolean {
