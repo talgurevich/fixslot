@@ -1,8 +1,10 @@
 import { Router } from "express";
 import { prisma, getConfig } from "../db";
 import { env } from "../config";
-import { FakeProvider } from "../messaging";
+import { FakeProvider, getProvider } from "../messaging";
 import { handleInbound } from "../conversationEngine";
+import { notifyTrainerOfCancellation } from "../notifier";
+import { formatSlot } from "../format";
 import { requireAuthApi, requireAuthPage } from "./auth";
 import { renderDashboard, renderLogin } from "./page";
 
@@ -118,7 +120,7 @@ dashboardRouter.delete("/api/blackouts/:id", requireAuthApi, async (req, res) =>
   res.sendStatus(204);
 });
 
-// --- Bookings (read-only for MVP) -----------------------------------------
+// --- Bookings --------------------------------------------------------------
 
 dashboardRouter.get("/api/bookings", requireAuthApi, async (_req, res) => {
   const bookings = await prisma.booking.findMany({
@@ -126,6 +128,38 @@ dashboardRouter.get("/api/bookings", requireAuthApi, async (_req, res) => {
     orderBy: { startTime: "asc" },
   });
   res.json(bookings);
+});
+
+// Trainer-initiated cancellation (issue #2). Hard-deletes the booking so the
+// slot becomes bookable again — relies on the unique-on-startTime guard (spec
+// §5) holding for the next booking. Also pings the client over WhatsApp so they
+// don't show up to a slot the trainer no longer has, and updates the trainer's
+// own WhatsApp log via the symmetric cancellation notification.
+dashboardRouter.delete("/api/bookings/:id", requireAuthApi, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid id" });
+
+  const booking = await prisma.booking.findUnique({ where: { id } });
+  if (!booking) return res.sendStatus(404);
+
+  await prisma.booking.delete({ where: { id } });
+
+  const config = await getConfig();
+  const provider = getProvider();
+  const slot = formatSlot(booking.startTime, config.timezone);
+  await provider.sendMessage(
+    booking.clientPhone,
+    `Your booking has been cancelled by the trainer: ${slot}.`,
+  );
+  await notifyTrainerOfCancellation(provider, {
+    trainerPhone: config.trainerPhone,
+    clientName: booking.clientName,
+    clientPhone: booking.clientPhone,
+    startTime: booking.startTime,
+    timezone: config.timezone,
+  });
+
+  res.sendStatus(204);
 });
 
 // --- Dev-only conversation simulator --------------------------------------

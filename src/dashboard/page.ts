@@ -67,8 +67,8 @@ export function renderDashboard(): string {
 
     <section class="card">
       <h2>Bookings</h2>
-      <p class="muted">Upcoming confirmed bookings (read-only).</p>
-      <table id="bookings"><thead><tr><th>When</th><th>Client</th><th>Phone</th></tr></thead><tbody></tbody></table>
+      <p class="muted">Upcoming confirmed bookings. Cancel here if the trainer can no longer make it — the client is notified on WhatsApp and the slot becomes bookable again.</p>
+      <table id="bookings"><thead><tr><th>When</th><th>Client</th><th>Phone</th><th></th></tr></thead><tbody></tbody></table>
     </section>
 
     <section class="card">
@@ -195,11 +195,20 @@ $("#add-bo").onclick = async () => {
 async function loadBookings() {
   const items = await api("/api/bookings");
   const body = $("#bookings tbody"); body.innerHTML = "";
-  if (!items.length) { body.innerHTML = '<tr><td colspan="3" class="muted">No upcoming bookings.</td></tr>'; return; }
+  if (!items.length) { body.innerHTML = '<tr><td colspan="4" class="muted">No upcoming bookings.</td></tr>'; return; }
   items.forEach((b) => {
     const tr = document.createElement("tr");
     const when = new Date(b.startTime).toLocaleString();
     tr.innerHTML = "<td>" + when + "</td><td>" + b.clientName + "</td><td>" + b.clientPhone + "</td>";
+    const actionCell = document.createElement("td");
+    const cancel = document.createElement("button");
+    cancel.className = "ghost"; cancel.textContent = "Cancel";
+    cancel.onclick = async () => {
+      if (!confirm("Cancel this booking? The client will be notified.")) return;
+      try { await api("/api/bookings/" + b.id, { method: "DELETE" }); loadBookings(); }
+      catch (e) { alert(e.message); }
+    };
+    actionCell.appendChild(cancel); tr.appendChild(actionCell);
     body.appendChild(tr);
   });
 }

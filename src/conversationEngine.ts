@@ -3,12 +3,21 @@ import { prisma, getConfig } from "./db";
 import { MessagingProvider } from "./messaging";
 import { generateSlots } from "./slotGenerator";
 import { formatSlot } from "./format";
-import { notifyTrainerOfBooking, notifyTrainerOfReschedule } from "./notifier";
+import {
+  notifyTrainerOfBooking,
+  notifyTrainerOfCancellation,
+  notifyTrainerOfReschedule,
+} from "./notifier";
 
 export interface InboundOptions {
   now?: Date;
   clientName?: string;
 }
+
+// Trigger word that puts the conversation into the cancellation branch (spec
+// issue #2). Kept as a single intuitive keyword to stay consistent with the
+// numbered-list style — no NLP, no menus.
+const CANCEL_KEYWORD = /^cancel$/i;
 
 // Entry point for an inbound client message (spec §6). Drives the per-client
 // state machine and sends replies via the injected provider so the engine never
@@ -29,6 +38,18 @@ export async function handleInbound(
     create: { clientPhone: phone },
     update: {},
   });
+
+  // "cancel" works from any state — a natural escape hatch into the cancel
+  // branch even mid-booking.
+  if (CANCEL_KEYWORD.test(text)) {
+    await offerCancellations(provider, phone, config, now);
+    return;
+  }
+
+  if (convo.state === "AWAITING_CANCEL_SELECTION") {
+    await handleCancelSelection(provider, phone, text, convo, config, now);
+    return;
+  }
 
   if (convo.state === "AWAITING_SELECTION") {
     await handleSelection(provider, phone, text, convo, config, now, clientName);
@@ -278,6 +299,105 @@ async function offerSlots(
     : config.greetingTemplate;
   const body = `${header}\n${lines.join("\n")}\nReply with a number to book.`;
   await provider.sendMessage(phone, body);
+}
+
+// Cancellation branch: list this client's upcoming bookings as a numbered
+// list (mirroring §6's flow) and put the conversation in
+// AWAITING_CANCEL_SELECTION. With no upcoming bookings, reply with a gentle
+// "nothing to cancel" and stay IDLE.
+async function offerCancellations(
+  provider: MessagingProvider,
+  phone: string,
+  config: Config,
+  now: Date,
+): Promise<void> {
+  const bookings = await prisma.booking.findMany({
+    where: { clientPhone: phone, startTime: { gte: now } },
+    orderBy: { startTime: "asc" },
+  });
+
+  if (bookings.length === 0) {
+    await prisma.conversation.update({
+      where: { clientPhone: phone },
+      data: { state: "IDLE", offeredSlots: "{}", offeredAt: null },
+    });
+    await provider.sendMessage(
+      phone,
+      "You have no upcoming bookings to cancel.",
+    );
+    return;
+  }
+
+  const offered: Record<string, string> = {};
+  const lines: string[] = [];
+  bookings.forEach((b, idx) => {
+    const n = idx + 1;
+    // Store the booking id (as a string) so the selection step can look it up
+    // directly, even if a duplicate clientPhone+startTime ever appeared.
+    offered[String(n)] = String(b.id);
+    lines.push(`${n}. ${formatSlot(b.startTime, config.timezone)}`);
+  });
+
+  await prisma.conversation.update({
+    where: { clientPhone: phone },
+    data: {
+      state: "AWAITING_CANCEL_SELECTION",
+      offeredSlots: JSON.stringify(offered),
+      offeredAt: now,
+    },
+  });
+
+  const body = `Your upcoming bookings:\n${lines.join("\n")}\nReply with a number to cancel.`;
+  await provider.sendMessage(phone, body);
+}
+
+async function handleCancelSelection(
+  provider: MessagingProvider,
+  phone: string,
+  text: string,
+  convo: Conversation,
+  config: Config,
+  now: Date,
+): Promise<void> {
+  const offered = JSON.parse(convo.offeredSlots) as Record<string, string>;
+  const offeredCount = Object.keys(offered).length;
+
+  const match = text.match(/^(\d+)$/);
+  const bookingIdStr = match ? offered[match[1]] : undefined;
+  if (!bookingIdStr) {
+    await provider.sendMessage(phone, reprompt(config, offeredCount));
+    return; // state unchanged
+  }
+
+  const bookingId = Number(bookingIdStr);
+  // Re-check the booking still belongs to this client and is still upcoming
+  // (it could have been cancelled by the trainer in the meantime).
+  const booking = await prisma.booking.findFirst({
+    where: { id: bookingId, clientPhone: phone, startTime: { gte: now } },
+  });
+  if (!booking) {
+    await offerCancellations(provider, phone, config, now);
+    return;
+  }
+
+  await prisma.booking.delete({ where: { id: booking.id } });
+
+  await prisma.conversation.update({
+    where: { clientPhone: phone },
+    data: { state: "IDLE", offeredSlots: "{}", offeredAt: null },
+  });
+
+  await provider.sendMessage(
+    phone,
+    `Cancelled: ${formatSlot(booking.startTime, config.timezone)}.`,
+  );
+  await notifyTrainerOfCancellation(provider, {
+    trainerPhone: config.trainerPhone,
+    clientName: booking.clientName,
+    clientPhone: phone,
+    startTime: booking.startTime,
+    timezone: config.timezone,
+  });
 }
 
 async function isSlotStillOpen(startTime: Date, now: Date): Promise<boolean> {
